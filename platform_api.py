@@ -450,8 +450,13 @@ def list_questions(section: str | None = None, kind: str | None = None, taxonomy
     params = {"admin": is_admin(user), "uid": str(user["id"]), "section": section, "kind": kind, "taxonomy_id": taxonomy_id}
     clauses.extend(["(:section IS NULL OR q.section=:section)", "(:kind IS NULL OR q.kind=:kind)", "(:taxonomy_id IS NULL OR q.taxonomy_id=CAST(:taxonomy_id AS UUID))"])
     with engine.connect() as c:
-        rows = c.execute(text("SELECT q.*,t.domain,t.skill FROM questions q LEFT JOIN taxonomies t ON t.id=q.taxonomy_id WHERE " + " AND ".join(clauses) + " ORDER BY q.created_at DESC"), params).mappings().all()
-    return [public_row(r) for r in rows]
+        rows = c.execute(text("""SELECT q.id::text AS id,q.owner_id::text AS owner_id,q.kind,q.section,q.prompt,q.choices,q.answer,
+          q.explanation,q.image_url,q.taxonomy_id::text AS taxonomy_id,q.is_active,q.created_at,q.updated_at,
+          t.domain,t.skill
+          FROM questions q LEFT JOIN taxonomies t ON t.id=q.taxonomy_id WHERE """ + " AND ".join(clauses) + " ORDER BY q.created_at DESC"), params).mappings().all()
+    # Return only the question-bank API fields. This avoids leaking unrelated
+    # legacy columns when an existing database has a wider questions table.
+    return [dict(r) for r in rows]
 
 
 def validate_question(payload):

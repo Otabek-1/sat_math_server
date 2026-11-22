@@ -16,6 +16,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 import os
+import logging
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
@@ -61,13 +62,7 @@ async def lifespan(app):
 
 app = FastAPI(title="Nemis Platform API", lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", FRONTEND_URL).split(",")],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+CORS_ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("CORS_ORIGINS", FRONTEND_URL).split(",") if origin.strip()]
 
 _auth_attempts = defaultdict(deque)
 
@@ -83,6 +78,15 @@ async def auth_rate_limit(request: Request, call_next):
             return JSONResponse(status_code=429, content={"detail": "Juda ko‘p urinish. Birozdan so‘ng qayta urinib ko‘ring."})
         bucket.append(now)
     return await call_next(request)
+
+
+@app.middleware("http")
+async def report_unhandled_errors(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception:
+        logging.exception("Unhandled request error: %s %s", request.method, request.url.path)
+        return JSONResponse(status_code=500, content={"detail": "Server ichki xatosi. Xatolik server jurnaliga yozildi."})
 
 
 class BrowserRegisterRequest(BaseModel):
@@ -525,3 +529,13 @@ def health():
 from platform_api import router as platform_router
 
 app.include_router(platform_router)
+
+# Put CORS outside FastAPI's error middleware too, so unexpected 500 responses
+# still reach the browser as readable JSON instead of a generic fetch failure.
+app = CORSMiddleware(
+    app,
+    allow_origins=CORS_ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)

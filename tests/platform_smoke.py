@@ -28,11 +28,21 @@ def run():
     database_url = os.getenv("PLATFORM_TEST_DATABASE_URL")
     if not database_url:
         raise RuntimeError("Set PLATFORM_TEST_DATABASE_URL to a disposable PostgreSQL database before running this smoke test")
+    if database_url == os.getenv("DATABASE_URL"):
+        raise RuntimeError("PLATFORM_TEST_DATABASE_URL must point to a separate disposable database, not the application database")
     admin_engine = create_engine(database_url, pool_pre_ping=True)
     schema = "platform_test_" + uuid.uuid4().hex[:12]
     with admin_engine.begin() as connection:
         connection.execute(text(f"CREATE SCHEMA {schema}"))
     isolated_engine = create_engine(database_url, connect_args={"options": f"-csearch_path={schema}"}, pool_pre_ping=True)
+    with isolated_engine.connect() as connection:
+        active_schema = connection.execute(text("SELECT current_schema()")).scalar_one()
+    if active_schema != schema:
+        isolated_engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(text(f"DROP SCHEMA {schema} CASCADE"))
+        admin_engine.dispose()
+        raise RuntimeError(f"Database ignored the isolated schema (active schema: {active_schema}); refusing to run integration writes")
     upload_dir = Path(tempfile.mkdtemp(prefix="nemis-platform-test-"))
     main.engine = isolated_engine
     platform_api.engine = isolated_engine
@@ -46,8 +56,9 @@ def run():
         with TestClient(main.app) as client:
             student = expect(client.post("/api/auth/register", json={"name": "Test Student", "email": student_email, "password": "test-password-123"}), 201, "register student")
             student_auth = {"Authorization": "Bearer " + student["access_token"]}
+            telegram_test_id = 700_000_000_000 + uuid.uuid4().int % 100_000_000_000
             with isolated_engine.begin() as connection:
-                connection.execute(text("UPDATE users SET telegram_id=700000001 WHERE id=CAST(:id AS UUID)"), {"id": student["user"]["id"]})
+                connection.execute(text("UPDATE users SET telegram_id=:telegram_id WHERE id=CAST(:id AS UUID)"), {"telegram_id": telegram_test_id, "id": student["user"]["id"]})
             expect(client.post("/api/groups", json={"name": "Denied group"}, headers=student_auth), 403, "student authorization")
             teacher_account = expect(client.post("/api/auth/register", json={"name": "Test Teacher", "email": teacher_email, "password": "test-password-123"}), 201, "register teacher account")
 
@@ -58,6 +69,8 @@ def run():
             group = expect(client.post("/api/groups", json={"name": "Test Group", "description": "temporary"}, headers=teacher_auth), 201, "group creation")
             expect(client.post(f"/api/groups/{group['id']}/members", json={"student_id": student["user"]["student_id"]}, headers=teacher_auth), 201, "student assignment")
             question = expect(client.post("/api/questions", json={"kind": "mcq", "section": "math", "prompt": "2+2?", "choices": ["4", "5"], "answer": "4"}, headers=teacher_auth), 201, "MCQ creation")
+            listed_questions = expect(client.get("/api/questions", headers=teacher_auth), 200, "question bank listing")
+            assert any(item["id"] == question["id"] for item in listed_questions)
             spr = expect(client.post("/api/questions", json={"kind": "spr", "section": "reading_writing", "prompt": "Type B", "answer": "B"}, headers=teacher_auth), 201, "SPR creation")
             expect(client.post("/api/questions", json={"kind": "mcq", "section": "math", "prompt": "2+2?", "choices": ["4", "5"], "answer": "4"}, headers=teacher_auth), 409, "duplicate question rejection")
 
