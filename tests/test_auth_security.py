@@ -58,3 +58,41 @@ def test_password_hash_uses_unique_salt_and_verifies():
     assert first != second
     assert hmac.compare_digest(first, backend.hash_password("safe-passphrase", salt)[0])
     assert not hmac.compare_digest(first, backend.hash_password("wrong-passphrase", salt)[0])
+
+
+def test_email_claim_is_serialized_and_checks_existing_accounts():
+    class ResultStub:
+        def first(self):
+            return "existing-user"
+
+    class ConnectionStub:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement, params):
+            self.statements.append((str(statement), params))
+            return ResultStub()
+
+    connection = ConnectionStub()
+    assert backend.lock_and_check_email(connection, "person@example.com") == "existing-user"
+    assert "pg_advisory_xact_lock" in connection.statements[0][0]
+    assert "lower(btrim(email))" in connection.statements[1][0]
+
+
+def test_email_claim_can_exclude_the_current_account():
+    class ResultStub:
+        def first(self):
+            return None
+
+    class ConnectionStub:
+        def __init__(self):
+            self.statement = None
+            self.params = None
+
+        def execute(self, statement, params):
+            self.statement, self.params = str(statement), params
+            return ResultStub()
+
+    connection = ConnectionStub()
+    assert backend.lock_and_check_email(connection, "person@example.com", "00000000-0000-0000-0000-000000000001") is None
+    assert "id <> CAST(:user_id AS UUID)" in connection.statement

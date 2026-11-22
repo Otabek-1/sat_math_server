@@ -222,6 +222,21 @@ def public_user(user):
     }
 
 
+def lock_and_check_email(connection, email, exclude_user_id=None):
+    """Serialize email claims and reject an existing identity before writing."""
+    connection.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:email, 0))"),
+        {"email": email},
+    )
+    query = "SELECT id FROM users WHERE lower(btrim(email)) = :email"
+    params = {"email": email}
+    if exclude_user_id is not None:
+        query += " AND id <> CAST(:user_id AS UUID)"
+        params["user_id"] = str(exclude_user_id)
+    query += " LIMIT 1"
+    return connection.execute(text(query), params).first()
+
+
 def verify_telegram_init_data(init_data):
     values = parse_qs(init_data, keep_blank_values=True)
     received_hash = values.pop("hash", [None])[0]
@@ -315,6 +330,8 @@ def register(payload: BrowserRegisterRequest):
 
     try:
         with engine.begin() as connection:
+            if lock_and_check_email(connection, email):
+                raise HTTPException(status_code=409, detail="Bu email allaqachon hisobga ulangan. Mavjud hisobga kiring.")
             result = connection.execute(
                 text(
                     """
@@ -382,6 +399,11 @@ def complete_telegram_account(payload: CompleteAccountRequest, user=Depends(get_
     password_hash, password_salt = hash_password(payload.password)
     try:
         with engine.begin() as connection:
+            if lock_and_check_email(connection, email, user["id"]):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Bu email boshqa hisobga ulangan. Mavjud hisobga kiring va Profil bo‘limidan Telegramni ulang.",
+                )
             result = connection.execute(text("""UPDATE users SET email=:email, password_hash=:password_hash,
                 password_salt=:password_salt, updated_at=NOW() WHERE id=CAST(:user_id AS UUID)
                 AND email IS NULL AND password_hash IS NULL RETURNING *"""),
