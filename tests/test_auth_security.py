@@ -96,3 +96,34 @@ def test_email_claim_can_exclude_the_current_account():
     connection = ConnectionStub()
     assert backend.lock_and_check_email(connection, "person@example.com", "00000000-0000-0000-0000-000000000001") is None
     assert "id <> CAST(:user_id AS UUID)" in connection.statement
+
+
+def test_sat_scoring_keeps_math_and_reading_writing_raw_scores_separate():
+    questions = [
+        {"id": "m1", "section": "math", "answer": "4"},
+        {"id": "r1", "section": "reading_writing", "answer": "B"},
+        {"id": "m2", "section": "math", "answer": "7"},
+    ]
+    from platform_api import score_answers
+    assert score_answers(questions, {"m1": " 4 ", "r1": "b", "m2": "wrong"}) == (1, 1)
+
+
+def test_student_question_view_does_not_leak_answer_key():
+    from platform_api import student_question
+    view = student_question({"id": "q1", "prompt": "x", "answer": "secret", "explanation": "secret explanation"})
+    assert view == {"id": "q1", "prompt": "x"}
+
+
+def test_question_hash_is_stable_for_same_content():
+    from platform_api import QuestionWrite, question_fingerprint, validate_question
+    question = QuestionWrite(kind="mcq", section="math", prompt="  2 + 2? ", choices=["4", "5"], answer="4")
+    choices = validate_question(question)
+    assert question_fingerprint(question, choices) == question_fingerprint(question, choices)
+
+
+def test_role_guard_rejects_student_admin_actions():
+    from fastapi import HTTPException
+    from platform_api import require_roles
+    with pytest.raises(HTTPException) as error:
+        require_roles({"role": "student"}, "admin")
+    assert error.value.status_code == 403

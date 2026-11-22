@@ -17,6 +17,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 import os
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -28,6 +29,7 @@ INTERNAL_API_SECRET = os.getenv("INTERNAL_API_SECRET", "")
 ACCESS_TOKEN_MINUTES = int(os.getenv("ACCESS_TOKEN_MINUTES", "30"))
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
+SUPER_ADMIN_USER_ID = os.getenv("SUPER_ADMIN_USER_ID", "").strip()
 TELEGRAM_AUTH_MAX_AGE = int(os.getenv("TELEGRAM_AUTH_MAX_AGE", "86400"))
 
 missing = [
@@ -44,7 +46,20 @@ if missing:
     raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-app = FastAPI(title="Nemis Platform API")
+
+
+@asynccontextmanager
+async def lifespan(app):
+    init_db()
+    from platform_api import init_platform_schema
+    with engine.begin() as connection:
+        init_platform_schema(connection)
+        if SUPER_ADMIN_USER_ID:
+            connection.execute(text("UPDATE users SET role='super_admin',student_id=NULL WHERE id=CAST(:id AS UUID)"), {"id": SUPER_ADMIN_USER_ID})
+    yield
+
+
+app = FastAPI(title="Nemis Platform API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -158,11 +173,6 @@ def init_db():
         """))
 
 
-@app.on_event("startup")
-def startup():
-    init_db()
-
-
 def hash_password(password, salt=None):
     salt = salt or secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac(
@@ -187,8 +197,8 @@ def create_access_token(user_id):
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 
-def get_current_user(authorization: str = Header(...)):
-    if not authorization.startswith("Bearer "):
+def get_current_user(authorization: str | None = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Avtorizatsiya talab qilinadi")
 
     token = authorization.removeprefix("Bearer ").strip()
@@ -219,6 +229,8 @@ def public_user(user):
         "username": user["username"],
         "first_name": user["first_name"],
         "last_name": user["last_name"],
+        "role": user.get("role", "student"),
+        "student_id": user.get("student_id"),
     }
 
 
@@ -283,14 +295,19 @@ def telegram_auth(payload: TelegramAuthRequest):
     username = telegram_user.get("username")
 
     with engine.begin() as connection:
+        existing = connection.execute(text("SELECT id FROM users WHERE telegram_id=:telegram_id"), {"telegram_id": telegram_id}).first()
+        if not existing:
+            enabled = connection.execute(text("SELECT value FROM platform_settings WHERE key='registration_enabled'")).scalar()
+            if enabled is not None and not enabled:
+                raise HTTPException(status_code=403, detail="Yangi ro‘yxatdan o‘tish vaqtincha yopilgan")
         connection.execute(
             text(
                 """
                 INSERT INTO users (
-                    telegram_id, username, first_name, last_name, updated_at
+                    telegram_id, username, first_name, last_name, student_id, updated_at
                 )
                 VALUES (
-                    :telegram_id, :username, :first_name, :last_name, NOW()
+                    :telegram_id, :username, :first_name, :last_name, :student_id, NOW()
                 )
                 ON CONFLICT (telegram_id) DO UPDATE SET
                     username = EXCLUDED.username,
@@ -304,6 +321,7 @@ def telegram_auth(payload: TelegramAuthRequest):
                 "username": username,
                 "first_name": first_name,
                 "last_name": last_name,
+                "student_id": f"STU-{secrets.token_hex(5).upper()}",
             },
         )
         user = connection.execute(
@@ -326,6 +344,10 @@ def telegram_auth(payload: TelegramAuthRequest):
 @app.post("/api/auth/register", status_code=status.HTTP_201_CREATED)
 def register(payload: BrowserRegisterRequest):
     email = str(payload.email).strip().lower()
+    with engine.connect() as connection:
+        enabled = connection.execute(text("SELECT value FROM platform_settings WHERE key='registration_enabled'")).scalar()
+    if enabled is not None and not enabled:
+        raise HTTPException(status_code=403, detail="Yangi ro‘yxatdan o‘tish vaqtincha yopilgan")
     password_hash, password_salt = hash_password(payload.password)
 
     try:
@@ -336,10 +358,10 @@ def register(payload: BrowserRegisterRequest):
                 text(
                     """
                     INSERT INTO users (
-                        email, first_name, password_hash, password_salt, updated_at
+                        email, first_name, password_hash, password_salt, role, student_id, updated_at
                     )
                     VALUES (
-                        :email, :name, :password_hash, :password_salt, NOW()
+                        :email, :name, :password_hash, :password_salt, :role, :student_id, NOW()
                     )
                     RETURNING *
                     """
@@ -349,6 +371,8 @@ def register(payload: BrowserRegisterRequest):
                     "name": payload.name,
                     "password_hash": password_hash,
                     "password_salt": password_salt,
+                    "role": "student",
+                    "student_id": f"STU-{secrets.token_hex(5).upper()}",
                 },
             )
             user = result.mappings().first()
@@ -409,6 +433,8 @@ def complete_telegram_account(payload: CompleteAccountRequest, user=Depends(get_
                 AND email IS NULL AND password_hash IS NULL RETURNING *"""),
                 {"email": email, "password_hash": password_hash, "password_salt": password_salt, "user_id": str(user["id"])})
             updated = result.mappings().first()
+            if updated:
+                connection.execute(text("INSERT INTO audit_logs(actor_id,action,target_type,target_id) VALUES (CAST(:id AS UUID),'telegram_account_completed','user',:target)"), {"id": str(user["id"]), "target": str(user["id"])})
     except IntegrityError:
         raise HTTPException(status_code=409, detail="Bu email boshqa hisobda ishlatilgan. Avval o‘sha hisobga kiring.")
     if not updated:
@@ -440,6 +466,7 @@ def create_link_challenge(user=Depends(get_current_user)):
     with engine.begin() as connection:
         connection.execute(text("INSERT INTO account_link_challenges (id,user_id,challenge_hash,expires_at) VALUES (CAST(:id AS UUID),CAST(:user_id AS UUID),:hash,NOW()+INTERVAL '10 minutes')"),
             {"id": challenge_id, "user_id": str(user["id"]), "hash": digest})
+        connection.execute(text("INSERT INTO audit_logs(actor_id,action,target_type,target_id) VALUES (CAST(:id AS UUID),'telegram_link_challenge_created','user',:target)"), {"id": str(user["id"]), "target": str(user["id"])})
     return {"url": f"https://t.me/{BOT_USERNAME}?start=link_{challenge}", "expires_in": 600}
 
 
@@ -452,6 +479,7 @@ def disconnect_telegram(user=Depends(get_current_user)):
     with engine.begin() as connection:
         connection.execute(text("UPDATE users SET telegram_id=NULL, updated_at=NOW() WHERE id=CAST(:id AS UUID)"), {"id": str(user["id"])})
         connection.execute(text("INSERT INTO account_security_events(actor_user_id,target_user_id,action) VALUES (CAST(:id AS UUID),CAST(:id AS UUID),'telegram_disconnected')"), {"id": str(user["id"])})
+        connection.execute(text("INSERT INTO audit_logs(actor_id,action,target_type,target_id) VALUES (CAST(:id AS UUID),'telegram_disconnected','user',:target)"), {"id": str(user["id"]), "target": str(user["id"])})
     return {"status": "disconnected"}
 
 
@@ -475,6 +503,8 @@ def complete_telegram_link(payload: LinkCompleteRequest, x_internal_secret: str 
             connection.execute(text("UPDATE account_link_challenges SET consumed_at=NOW() WHERE id=:id"), {"id": challenge["id"]})
             connection.execute(text("INSERT INTO account_security_events(actor_user_id,target_user_id,action,metadata) VALUES (CAST(:id AS UUID),CAST(:id AS UUID),'telegram_connected',CAST(:metadata AS JSONB))"),
                 {"id": str(challenge["user_id"]), "metadata": json.dumps({"telegram_id": payload.telegram_id})})
+            connection.execute(text("INSERT INTO audit_logs(actor_id,action,target_type,target_id,metadata) VALUES (CAST(:id AS UUID),'telegram_connected','user',:target,CAST(:metadata AS JSONB))"),
+                {"id": str(challenge["user_id"]), "target": str(challenge["user_id"]), "metadata": json.dumps({"telegram_id": payload.telegram_id})})
     except IntegrityError:
         raise HTTPException(status_code=409, detail="Telegram hisobi boshqa platforma hisobiga ulangan")
     return {"status": "connected"}
@@ -490,3 +520,8 @@ def health():
     with engine.connect() as connection:
         connection.execute(text("SELECT 1"))
     return {"status": "ok"}
+
+
+from platform_api import router as platform_router
+
+app.include_router(platform_router)
