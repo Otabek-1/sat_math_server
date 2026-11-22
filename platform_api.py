@@ -53,6 +53,9 @@ SCHEMA = [
     "CREATE INDEX IF NOT EXISTS questions_owner_idx ON questions(owner_id,created_at DESC)",
     "ALTER TABLE questions ADD COLUMN IF NOT EXISTS content_hash TEXT",
     "CREATE UNIQUE INDEX IF NOT EXISTS questions_owner_content_unique ON questions(owner_id,content_hash) WHERE content_hash IS NOT NULL",
+    "ALTER TABLE questions ADD COLUMN IF NOT EXISTS difficulty TEXT NOT NULL DEFAULT 'medium'",
+    "ALTER TABLE questions DROP CONSTRAINT IF EXISTS questions_difficulty_check",
+    "ALTER TABLE questions ADD CONSTRAINT questions_difficulty_check CHECK(difficulty IN ('easy','medium','hard'))",
     """CREATE TABLE IF NOT EXISTS assignments (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(), teacher_id UUID NOT NULL REFERENCES users(id), group_id UUID NOT NULL REFERENCES groups(id),
         title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', question_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -62,6 +65,11 @@ SCHEMA = [
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(), assignment_id UUID NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
         student_id UUID NOT NULL REFERENCES users(id), answers JSONB NOT NULL DEFAULT '{}'::jsonb, raw_score INTEGER NOT NULL DEFAULT 0,
         total_questions INTEGER NOT NULL DEFAULT 0, submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(assignment_id,student_id))""",
+    "ALTER TABLE assignments ADD COLUMN IF NOT EXISTS selection_rules JSONB NOT NULL DEFAULT '[]'::jsonb",
+    """CREATE TABLE IF NOT EXISTS assignment_question_sets (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), assignment_id UUID NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+        student_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, question_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(assignment_id,student_id))""",
     """CREATE TABLE IF NOT EXISTS mocks (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(), owner_id UUID NOT NULL REFERENCES users(id), title TEXT NOT NULL,
         description TEXT NOT NULL DEFAULT '', question_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -73,6 +81,11 @@ SCHEMA = [
         CHECK ((group_id IS NULL) <> (user_id IS NULL)))""",
     "CREATE UNIQUE INDEX IF NOT EXISTS mock_target_group_unique ON mock_targets(mock_id,group_id) WHERE group_id IS NOT NULL",
     "CREATE UNIQUE INDEX IF NOT EXISTS mock_target_user_unique ON mock_targets(mock_id,user_id) WHERE user_id IS NOT NULL",
+    "ALTER TABLE mocks ADD COLUMN IF NOT EXISTS selection_rules JSONB NOT NULL DEFAULT '[]'::jsonb",
+    """CREATE TABLE IF NOT EXISTS mock_question_sets (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), mock_id UUID NOT NULL REFERENCES mocks(id) ON DELETE CASCADE,
+        student_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, question_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(mock_id,student_id))""",
     """CREATE TABLE IF NOT EXISTS mock_attempts (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(), mock_id UUID NOT NULL REFERENCES mocks(id), student_id UUID NOT NULL REFERENCES users(id),
         attempt_number INTEGER NOT NULL, answers JSONB NOT NULL DEFAULT '{}'::jsonb, raw_math INTEGER NOT NULL DEFAULT 0,
@@ -169,8 +182,6 @@ def question_rows(connection, question_ids, user=None):
     if len(by_id) != len(set(ids)):
         raise HTTPException(status_code=422, detail="Savollardan biri topilmadi")
     selected = [by_id[item] for item in ids]
-    if user and user["role"] == "teacher" and any(str(q["owner_id"]) != str(user["id"]) for q in selected):
-        raise HTTPException(status_code=403, detail="Boshqa o‘qituvchining savolidan foydalanish mumkin emas")
     return selected
 
 
@@ -227,6 +238,15 @@ class QuestionWrite(BaseModel):
     explanation: str = Field(default="", max_length=12000)
     image_url: HttpUrl | None = None
     taxonomy_id: str | None = None
+    difficulty: str = "medium"
+
+
+class SelectionRule(BaseModel):
+    count: int = Field(ge=1, le=100)
+    section: str = "math"
+    difficulty: str = "medium"
+    taxonomy_id: str | None = None
+    kind: str | None = None
 
 
 class AssignmentWrite(BaseModel):
@@ -234,6 +254,7 @@ class AssignmentWrite(BaseModel):
     title: str = Field(min_length=2, max_length=200)
     description: str = Field(default="", max_length=6000)
     question_ids: list[str] = Field(default_factory=list)
+    selection_rules: list[SelectionRule] = Field(default_factory=list)
     deadline: datetime | None = None
 
 
@@ -245,6 +266,7 @@ class MockWrite(BaseModel):
     title: str = Field(min_length=2, max_length=200)
     description: str = Field(default="", max_length=6000)
     question_ids: list[str] = Field(default_factory=list)
+    selection_rules: list[SelectionRule] = Field(default_factory=list)
     group_ids: list[str] = Field(default_factory=list)
     student_ids: list[str] = Field(default_factory=list)
     opens_at: datetime | None = None
@@ -446,8 +468,8 @@ def search_student(student_id: str = Query(min_length=3, max_length=40), group_i
 @router.get("/questions")
 def list_questions(section: str | None = None, kind: str | None = None, taxonomy_id: str | None = None, user=Depends(get_current_user)):
     require_roles(user, "teacher", "admin", "super_admin")
-    clauses = ["q.is_active", "(:admin OR q.owner_id=CAST(:uid AS UUID))"]
-    params = {"admin": is_admin(user), "uid": str(user["id"])}
+    clauses = ["q.is_active"]
+    params = {}
     if section is not None:
         if section not in {"math", "reading_writing"}:
             raise HTTPException(status_code=422, detail="Savol bo‘limi noto‘g‘ri")
@@ -466,7 +488,7 @@ def list_questions(section: str | None = None, kind: str | None = None, taxonomy
         clauses.append("q.taxonomy_id=CAST(:taxonomy_id AS UUID)")
     with engine.connect() as c:
         rows = c.execute(text("""SELECT q.id::text AS id,q.owner_id::text AS owner_id,q.kind,q.section,q.prompt,q.choices,q.answer,
-          q.explanation,q.image_url,q.taxonomy_id::text AS taxonomy_id,q.is_active,q.created_at,q.updated_at,
+          q.explanation,q.image_url,q.taxonomy_id::text AS taxonomy_id,q.difficulty,q.is_active,q.created_at,q.updated_at,
           t.domain,t.skill
           FROM questions q LEFT JOIN taxonomies t ON t.id=q.taxonomy_id WHERE """ + " AND ".join(clauses) + " ORDER BY q.created_at DESC"), params).mappings().all()
     # Return only the question-bank API fields. This avoids leaking unrelated
@@ -477,6 +499,8 @@ def list_questions(section: str | None = None, kind: str | None = None, taxonomy
 def validate_question(payload):
     if payload.kind not in {"mcq", "spr"} or payload.section not in {"math", "reading_writing"}:
         raise HTTPException(status_code=422, detail="Savol turi yoki bo‘limi noto‘g‘ri")
+    if payload.difficulty not in {"easy", "medium", "hard"}:
+        raise HTTPException(status_code=422, detail="Savol qiyinchilik darajasi noto‘g‘ri")
     choices = [choice.strip() for choice in payload.choices if choice.strip()]
     if payload.kind == "mcq" and (len(choices) < 2 or len(set(choices)) != len(choices) or payload.answer.strip() not in choices):
         raise HTTPException(status_code=422, detail="MCQ savoliga takrorlanmaydigan javob variantlari va ular ichidan to‘g‘ri javob kerak")
@@ -498,8 +522,55 @@ def question_fingerprint(payload, choices):
         "explanation": " ".join(payload.explanation.split()),
         "image_url": str(payload.image_url) if payload.image_url else None,
         "taxonomy_id": payload.taxonomy_id,
+        "difficulty": payload.difficulty,
     }
     return hashlib.sha256(json.dumps(canonical, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+def resolve_question_selection(connection, manual_ids, rules):
+    ids = []
+    if manual_ids:
+        ids.extend(str(row["id"]) for row in question_rows(connection, manual_ids))
+
+    for rule in rules:
+        if isinstance(rule, dict):
+            rule = SelectionRule(**rule)
+        if rule.section not in {"math", "reading_writing"}:
+            raise HTTPException(status_code=422, detail="Savol bo‘limi noto‘g‘ri")
+        if rule.difficulty not in {"easy", "medium", "hard"}:
+            raise HTTPException(status_code=422, detail="Savol qiyinchilik darajasi noto‘g‘ri")
+        if rule.kind is not None and rule.kind not in {"mcq", "spr"}:
+            raise HTTPException(status_code=422, detail="Savol turi noto‘g‘ri")
+
+        clauses = ["q.is_active", "q.section=:section", "q.difficulty=:difficulty"]
+        params = {"section": rule.section, "difficulty": rule.difficulty, "count": rule.count}
+        if rule.kind:
+            clauses.append("q.kind=:kind")
+            params["kind"] = rule.kind
+        if rule.taxonomy_id:
+            try:
+                params["taxonomy"] = str(uuid.UUID(rule.taxonomy_id))
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Taksonomiya ID yaroqsiz")
+            clauses.append("q.taxonomy_id=CAST(:taxonomy AS UUID)")
+
+        rows = connection.execute(
+            text("""SELECT q.id::text AS id FROM questions q
+              WHERE """ + " AND ".join(clauses) +
+              " ORDER BY RANDOM() LIMIT :count"),
+            params,
+        ).mappings().all()
+        if len(rows) != rule.count:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Tanlangan shartlar uchun yetarli savol yo‘q: {rule.section}, {rule.difficulty}, {rule.count} ta kerak",
+            )
+        ids.extend(row["id"] for row in rows)
+
+    unique_ids = list(dict.fromkeys(ids))
+    if not unique_ids:
+        raise HTTPException(status_code=422, detail="Kamida bitta savol tanlang yoki qoidalar qo‘shing")
+    return unique_ids
 
 
 def ensure_private_bucket():
@@ -524,9 +595,9 @@ def create_question(payload: QuestionWrite, user=Depends(get_current_user)):
             taxonomy = c.execute(text("SELECT section FROM taxonomies WHERE id=CAST(:id AS UUID)"), {"id": payload.taxonomy_id}).first()
             if not taxonomy or taxonomy[0] != payload.section: raise HTTPException(status_code=422, detail="Taxonomiya savol bo‘limiga mos emas")
         try:
-            row = c.execute(text("""INSERT INTO questions(owner_id,kind,section,prompt,choices,answer,explanation,image_url,taxonomy_id,content_hash)
-              VALUES(CAST(:uid AS UUID),:kind,:section,:prompt,CAST(:choices AS JSONB),:answer,:explanation,:image,CAST(:taxonomy AS UUID),:fingerprint) RETURNING *"""),
-              {"uid": str(user["id"]), "kind": payload.kind, "section": payload.section, "prompt": payload.prompt, "choices": json.dumps(choices), "answer": payload.answer.strip(), "explanation": payload.explanation, "image": str(payload.image_url) if payload.image_url else None, "taxonomy": payload.taxonomy_id, "fingerprint": question_fingerprint(payload, choices)}).mappings().first()
+            row = c.execute(text("""INSERT INTO questions(owner_id,kind,section,prompt,choices,answer,explanation,image_url,taxonomy_id,difficulty,content_hash)
+              VALUES(CAST(:uid AS UUID),:kind,:section,:prompt,CAST(:choices AS JSONB),:answer,:explanation,:image,CAST(:taxonomy AS UUID),:difficulty,:fingerprint) RETURNING *"""),
+              {"uid": str(user["id"]), "kind": payload.kind, "section": payload.section, "prompt": payload.prompt, "choices": json.dumps(choices), "answer": payload.answer.strip(), "explanation": payload.explanation, "image": str(payload.image_url) if payload.image_url else None, "taxonomy": payload.taxonomy_id, "difficulty": payload.difficulty, "fingerprint": question_fingerprint(payload, choices)}).mappings().first()
         except IntegrityError:
             raise HTTPException(status_code=409, detail="Bu savol savollar bankida avvaldan mavjud")
         audit(c, user, "question_created", "question", row["id"], {"kind": payload.kind, "section": payload.section})
@@ -543,9 +614,9 @@ def update_question(question_id: str, payload: QuestionWrite, user=Depends(get_c
             if not taxonomy or taxonomy[0]!=payload.section:raise HTTPException(status_code=422,detail="Taxonomiya savol bo‘limiga mos emas")
         try:
             row = c.execute(text("""UPDATE questions SET kind=:kind,section=:section,prompt=:prompt,choices=CAST(:choices AS JSONB),answer=:answer,
-          explanation=:explanation,image_url=:image,taxonomy_id=CAST(:taxonomy AS UUID),content_hash=:fingerprint,updated_at=NOW()
-          WHERE id=CAST(:id AS UUID) AND (:admin OR owner_id=CAST(:uid AS UUID)) RETURNING *"""),
-          {"kind": payload.kind, "section": payload.section, "prompt": payload.prompt, "choices": json.dumps(choices), "answer": payload.answer.strip(), "explanation": payload.explanation, "image": str(payload.image_url) if payload.image_url else None, "taxonomy": payload.taxonomy_id, "fingerprint": question_fingerprint(payload, choices), "id": question_id, "admin": is_admin(user), "uid": str(user["id"])}).mappings().first()
+          explanation=:explanation,image_url=:image,taxonomy_id=CAST(:taxonomy AS UUID),difficulty=:difficulty,content_hash=:fingerprint,updated_at=NOW()
+          WHERE id=CAST(:id AS UUID) RETURNING *"""),
+          {"kind": payload.kind, "section": payload.section, "prompt": payload.prompt, "choices": json.dumps(choices), "answer": payload.answer.strip(), "explanation": payload.explanation, "image": str(payload.image_url) if payload.image_url else None, "taxonomy": payload.taxonomy_id, "difficulty": payload.difficulty, "fingerprint": question_fingerprint(payload, choices), "id": question_id}).mappings().first()
         except IntegrityError:
             raise HTTPException(status_code=409,detail="Tahrirlangan savol shu savollar bankida mavjud")
         if not row: raise HTTPException(status_code=404, detail="Savol topilmadi yoki tahrirlashga ruxsat yo‘q")
@@ -612,9 +683,11 @@ def create_assignment(payload: AssignmentWrite, user=Depends(get_current_user)):
     if payload.deadline and payload.deadline.tzinfo is None: raise HTTPException(status_code=422, detail="Muddat timezone bilan yuborilishi kerak")
     with engine.begin() as c:
         if not group_allowed(c,user,payload.group_id,write=True): raise HTTPException(status_code=404, detail="Guruh topilmadi")
-        if payload.question_ids: question_rows(c,payload.question_ids,user)
-        row = c.execute(text("INSERT INTO assignments(teacher_id,group_id,title,description,question_ids,deadline) VALUES(CAST(:uid AS UUID),CAST(:gid AS UUID),:title,:description,CAST(:qids AS JSONB),:deadline) RETURNING *"),
-          {"uid":str(user["id"]),"gid":payload.group_id,"title":payload.title,"description":payload.description,"qids":json.dumps(payload.question_ids),"deadline":payload.deadline}).mappings().first()
+        selection_rules = [rule.model_dump() for rule in payload.selection_rules]
+        if payload.question_ids or selection_rules:
+            resolve_question_selection(c, payload.question_ids, payload.selection_rules)
+        row = c.execute(text("INSERT INTO assignments(teacher_id,group_id,title,description,question_ids,selection_rules,deadline) VALUES(CAST(:uid AS UUID),CAST(:gid AS UUID),:title,:description,CAST(:qids AS JSONB),CAST(:rules AS JSONB),:deadline) RETURNING *"),
+          {"uid":str(user["id"]),"gid":payload.group_id,"title":payload.title,"description":payload.description,"qids":json.dumps(payload.question_ids),"rules":json.dumps(selection_rules),"deadline":payload.deadline}).mappings().first()
         audit(c,user,"assignment_draft_created","assignment",row["id"])
     return public_row(row)
 
@@ -628,8 +701,10 @@ def update_assignment(assignment_id: str, payload: AssignmentWrite, user=Depends
         if not old or (not is_admin(user) and str(old["teacher_id"])!=str(user["id"]) and not group_allowed(c,user,old["group_id"],write=True)): raise HTTPException(status_code=404,detail="Vazifa topilmadi")
         if old["status"]!="draft": raise HTTPException(status_code=409,detail="Faqat qoralama vazifani tahrirlash mumkin")
         if not group_allowed(c,user,payload.group_id,write=True): raise HTTPException(status_code=404,detail="Guruh topilmadi")
-        if payload.question_ids: question_rows(c,payload.question_ids,user)
-        row=c.execute(text("UPDATE assignments SET group_id=CAST(:gid AS UUID),title=:title,description=:description,question_ids=CAST(:qids AS JSONB),deadline=:deadline,updated_at=NOW() WHERE id=CAST(:id AS UUID) RETURNING *"),{"gid":payload.group_id,"title":payload.title,"description":payload.description,"qids":json.dumps(payload.question_ids),"deadline":payload.deadline,"id":assignment_id}).mappings().first()
+        selection_rules = [rule.model_dump() for rule in payload.selection_rules]
+        if payload.question_ids or selection_rules:
+            resolve_question_selection(c, payload.question_ids, payload.selection_rules)
+        row=c.execute(text("UPDATE assignments SET group_id=CAST(:gid AS UUID),title=:title,description=:description,question_ids=CAST(:qids AS JSONB),selection_rules=CAST(:rules AS JSONB),deadline=:deadline,updated_at=NOW() WHERE id=CAST(:id AS UUID) RETURNING *"),{"gid":payload.group_id,"title":payload.title,"description":payload.description,"qids":json.dumps(payload.question_ids),"rules":json.dumps(selection_rules),"deadline":payload.deadline,"id":assignment_id}).mappings().first()
     return public_row(row)
 
 
@@ -640,7 +715,7 @@ def publish_assignment(assignment_id: str, user=Depends(get_current_user)):
         source=c.execute(text("SELECT * FROM assignments WHERE id=CAST(:id AS UUID) FOR UPDATE"),{"id":assignment_id}).mappings().first()
         if not source:raise HTTPException(status_code=404,detail="Vazifa topilmadi")
         if not is_admin(user) and str(source["teacher_id"])!=str(user["id"]) and not group_allowed(c,user,source["group_id"],write=True):raise HTTPException(status_code=404,detail="Vazifa topilmadi")
-        if not source[0]:raise HTTPException(status_code=409,detail="E’lon qilishdan oldin savol qo‘shing")
+        if not source["question_ids"] and not source["selection_rules"]:raise HTTPException(status_code=409,detail="E’lon qilishdan oldin savol qo‘shing")
         row=c.execute(text("UPDATE assignments SET status='published',updated_at=NOW() WHERE id=CAST(:id AS UUID) AND status='draft' RETURNING *"),{"id":assignment_id}).mappings().first()
         if not row: raise HTTPException(status_code=404,detail="Qoralama vazifa topilmadi yoki ruxsat yo‘q")
         audit(c,user,"assignment_published","assignment",assignment_id)
@@ -655,7 +730,13 @@ def submit_assignment(assignment_id: str,payload: SubmissionWrite,user=Depends(g
         assignment=c.execute(text("SELECT * FROM assignments WHERE id=CAST(:id AS UUID) AND status='published' FOR UPDATE"),{"id":assignment_id}).mappings().first()
         if not assignment or not group_allowed(c,user,assignment["group_id"]): raise HTTPException(status_code=404,detail="Ochiq vazifa topilmadi")
         if assignment["deadline"] and assignment["deadline"]<datetime.now(timezone.utc): raise HTTPException(status_code=410,detail="Vazifa muddati tugagan")
-        qs=question_rows(c,assignment["question_ids"])
+        set_row=c.execute(text("SELECT question_ids FROM assignment_question_sets WHERE assignment_id=CAST(:aid AS UUID) AND student_id=CAST(:uid AS UUID)"),{"aid":assignment_id,"uid":str(user["id"])}).first()
+        if set_row:
+            qs=question_rows(c,list(set_row[0]))
+        else:
+            ids=resolve_question_selection(c,assignment["question_ids"] or [],assignment["selection_rules"] or [])
+            c.execute(text("INSERT INTO assignment_question_sets(assignment_id,student_id,question_ids) VALUES(CAST(:aid AS UUID),CAST(:uid AS UUID),CAST(:ids AS JSONB))"),{"aid":assignment_id,"uid":str(user["id"]),"ids":json.dumps(ids)})
+            qs=question_rows(c,ids)
         math_score,rw_score=score_answers(qs,payload.answers)
         raw=math_score+rw_score
         row=c.execute(text("""INSERT INTO assignment_submissions(assignment_id,student_id,answers,raw_score,total_questions)
@@ -673,7 +754,20 @@ def assignment_questions(assignment_id: str, user=Depends(get_current_user)):
         if user["role"]=="student":
             if assignment["status"]!="published" or not group_allowed(c,user,assignment["group_id"]):raise HTTPException(status_code=404,detail="Vazifa topilmadi")
         elif not is_admin(user) and str(assignment["teacher_id"])!=str(user["id"]):raise HTTPException(status_code=404,detail="Vazifa topilmadi")
-        questions=question_rows(c,assignment["question_ids"])
+        if user["role"]=="student":
+            set_row=c.execute(text("SELECT question_ids FROM assignment_question_sets WHERE assignment_id=CAST(:aid AS UUID) AND student_id=CAST(:uid AS UUID)"),{"aid":assignment_id,"uid":str(user["id"])}).first()
+            if set_row:
+                ids=list(set_row[0])
+            else:
+                ids=resolve_question_selection(c,assignment["question_ids"] or [],assignment["selection_rules"] or [])
+                c.execute(text("INSERT INTO assignment_question_sets(assignment_id,student_id,question_ids) VALUES(CAST(:aid AS UUID),CAST(:uid AS UUID),CAST(:ids AS JSONB))"),{"aid":assignment_id,"uid":str(user["id"]),"ids":json.dumps(ids)})
+            questions=question_rows(c,ids)
+        else:
+            if assignment["selection_rules"]:
+                ids=resolve_question_selection(c,assignment["question_ids"] or [],assignment["selection_rules"] or [])
+            else:
+                ids=assignment["question_ids"]
+            questions=question_rows(c,ids)
     return [student_question(q) if user["role"]=="student" else q for q in questions]
 
 
@@ -703,10 +797,15 @@ def create_mock(payload:MockWrite,user=Depends(get_current_user)):
     require_roles(user,"teacher","admin","super_admin")
     if payload.opens_at and payload.opens_at.tzinfo is None or payload.deadline and payload.deadline.tzinfo is None: raise HTTPException(status_code=422,detail="Sana timezone bilan yuborilishi kerak")
     with engine.begin() as c:
-        qs=question_rows(c,payload.question_ids,user)
+        selection_rules=[rule.model_dump() for rule in payload.selection_rules]
+        if payload.question_ids or selection_rules:
+            resolved=resolve_question_selection(c,payload.question_ids,payload.selection_rules)
+        else:
+            raise HTTPException(status_code=422,detail="Kamida bitta savol tanlang yoki random qoidalar qo‘shing")
+        qs=question_rows(c,resolved)
         for gid in set(payload.group_ids):
             if not group_allowed(c,user,gid,write=True): raise HTTPException(status_code=404,detail="Guruh topilmadi")
-        row=c.execute(text("INSERT INTO mocks(owner_id,title,description,question_ids,opens_at,deadline) VALUES(CAST(:uid AS UUID),:title,:description,CAST(:qids AS JSONB),:opens,:deadline) RETURNING *"),{"uid":str(user["id"]),"title":payload.title,"description":payload.description,"qids":json.dumps(payload.question_ids),"opens":payload.opens_at,"deadline":payload.deadline}).mappings().first()
+        row=c.execute(text("INSERT INTO mocks(owner_id,title,description,question_ids,selection_rules,opens_at,deadline) VALUES(CAST(:uid AS UUID),:title,:description,CAST(:qids AS JSONB),CAST(:rules AS JSONB),:opens,:deadline) RETURNING *"),{"uid":str(user["id"]),"title":payload.title,"description":payload.description,"qids":json.dumps(payload.question_ids),"rules":json.dumps(selection_rules),"opens":payload.opens_at,"deadline":payload.deadline}).mappings().first()
         for gid in set(payload.group_ids):c.execute(text("INSERT INTO mock_targets(mock_id,group_id) VALUES(CAST(:mid AS UUID),CAST(:gid AS UUID))"),{"mid":str(row["id"]),"gid":gid})
         for sid in set(payload.student_ids):
             valid=c.execute(text("SELECT id FROM users WHERE id=CAST(:sid AS UUID) AND role='student' AND is_active"),{"sid":sid}).first()
@@ -724,8 +823,12 @@ def update_mock(mock_id:str,payload:MockWrite,user=Depends(get_current_user)):
         old=c.execute(text("SELECT * FROM mocks WHERE id=CAST(:id AS UUID) FOR UPDATE"),{"id":mock_id}).mappings().first()
         if not old or(not is_admin(user) and str(old["owner_id"])!=str(user["id"])): raise HTTPException(status_code=404,detail="Mock topilmadi")
         if old["status"]!="draft": raise HTTPException(status_code=409,detail="Faqat qoralama mockni tahrirlash mumkin")
-        question_rows(c,payload.question_ids,user)
-        row=c.execute(text("UPDATE mocks SET title=:title,description=:description,question_ids=CAST(:qids AS JSONB),opens_at=:opens,deadline=:deadline,updated_at=NOW() WHERE id=CAST(:id AS UUID) RETURNING *"),{"title":payload.title,"description":payload.description,"qids":json.dumps(payload.question_ids),"opens":payload.opens_at,"deadline":payload.deadline,"id":mock_id}).mappings().first()
+        selection_rules=[rule.model_dump() for rule in payload.selection_rules]
+        if payload.question_ids or selection_rules:
+            resolve_question_selection(c,payload.question_ids,payload.selection_rules)
+        else:
+            raise HTTPException(status_code=422,detail="Kamida bitta savol tanlang yoki random qoidalar qo‘shing")
+        row=c.execute(text("UPDATE mocks SET title=:title,description=:description,question_ids=CAST(:qids AS JSONB),selection_rules=CAST(:rules AS JSONB),opens_at=:opens,deadline=:deadline,updated_at=NOW() WHERE id=CAST(:id AS UUID) RETURNING *"),{"title":payload.title,"description":payload.description,"qids":json.dumps(payload.question_ids),"rules":json.dumps(selection_rules),"opens":payload.opens_at,"deadline":payload.deadline,"id":mock_id}).mappings().first()
         c.execute(text("DELETE FROM mock_targets WHERE mock_id=CAST(:id AS UUID)"),{"id":mock_id})
         for gid in set(payload.group_ids):
             if not group_allowed(c,user,gid,write=True): raise HTTPException(status_code=404,detail="Guruh topilmadi")
@@ -743,8 +846,7 @@ def open_mock(mock_id:str,user=Depends(get_current_user)):
     with engine.begin() as c:
         mock=c.execute(text("SELECT * FROM mocks WHERE id=CAST(:id AS UUID) FOR UPDATE"),{"id":mock_id}).mappings().first()
         if not mock or not teacher_can_manage_mock(c,user,mock):raise HTTPException(status_code=404,detail="Mock topilmadi")
-        source=(mock["question_ids"],)
-        if not source[0]:raise HTTPException(status_code=409,detail="Mockni ochishdan oldin savollar qo‘shing")
+        if not mock["question_ids"] and not mock["selection_rules"]:raise HTTPException(status_code=409,detail="Mockni ochishdan oldin savollar qo‘shing")
         if not c.execute(text("SELECT 1 FROM mock_targets WHERE mock_id=CAST(:id AS UUID) LIMIT 1"),{"id":mock_id}).first():raise HTTPException(status_code=409,detail="Mockni ochishdan oldin guruh yoki o‘quvchiga biriktiring")
         row=c.execute(text("UPDATE mocks SET status='open',updated_at=NOW() WHERE id=CAST(:id AS UUID) AND status='draft' RETURNING *"),{"id":mock_id}).mappings().first()
         if not row:raise HTTPException(status_code=404,detail="Qoralama mock topilmadi")
@@ -792,7 +894,13 @@ def submit_mock_attempt(mock_id:str,payload:SubmissionWrite,user=Depends(get_cur
         if not mock:raise HTTPException(status_code=404,detail="Mock hozir ochiq emas")
         target=c.execute(text("SELECT 1 FROM mock_targets t WHERE t.mock_id=CAST(:mid AS UUID) AND (t.user_id=CAST(:uid AS UUID) OR EXISTS(SELECT 1 FROM group_members gm WHERE gm.group_id=t.group_id AND gm.student_id=CAST(:uid AS UUID)))"),{"mid":mock_id,"uid":str(user["id"])}).first()
         if not target:raise HTTPException(status_code=403,detail="Bu mock sizga biriktirilmagan")
-        qs=question_rows(c,mock["question_ids"],user)
+        set_row=c.execute(text("SELECT question_ids FROM mock_question_sets WHERE mock_id=CAST(:mid AS UUID) AND student_id=CAST(:uid AS UUID)"),{"mid":mock_id,"uid":str(user["id"])}).first()
+        if set_row:
+            qs=question_rows(c,list(set_row[0]),user)
+        else:
+            ids=resolve_question_selection(c,mock["question_ids"] or [],mock["selection_rules"] or [])
+            c.execute(text("INSERT INTO mock_question_sets(mock_id,student_id,question_ids) VALUES(CAST(:mid AS UUID),CAST(:uid AS UUID),CAST(:ids AS JSONB))"),{"mid":mock_id,"uid":str(user["id"]),"ids":json.dumps(ids)})
+            qs=question_rows(c,ids,user)
         math_score,rw_score=score_answers(qs,payload.answers)
         num=c.execute(text("SELECT COALESCE(MAX(attempt_number),0)+1 FROM mock_attempts WHERE mock_id=CAST(:mid AS UUID) AND student_id=CAST(:uid AS UUID)"),{"mid":mock_id,"uid":str(user["id"])}).scalar_one()
         row=c.execute(text("INSERT INTO mock_attempts(mock_id,student_id,attempt_number,answers,raw_math,raw_reading_writing,total_questions) VALUES(CAST(:mid AS UUID),CAST(:uid AS UUID),:num,CAST(:answers AS JSONB),:math,:rw,:total) RETURNING *"),{"mid":mock_id,"uid":str(user["id"]),"num":num,"answers":json.dumps(payload.answers),"math":math_score,"rw":rw_score,"total":len(qs)}).mappings().first()
@@ -810,7 +918,19 @@ def mock_questions(mock_id:str,user=Depends(get_current_user)):
             target=c.execute(text("SELECT 1 FROM mock_targets t WHERE t.mock_id=CAST(:mid AS UUID) AND (t.user_id=CAST(:uid AS UUID) OR EXISTS(SELECT 1 FROM group_members gm WHERE gm.group_id=t.group_id AND gm.student_id=CAST(:uid AS UUID)))"),{"mid":mock_id,"uid":str(user["id"])}).first()
             if not target:raise HTTPException(status_code=403,detail="Bu mock sizga biriktirilmagan")
         elif not teacher_can_manage_mock(c,user,mock):raise HTTPException(status_code=404,detail="Mock topilmadi")
-        questions=question_rows(c,mock["question_ids"])
+        if user["role"]=="student":
+            set_row=c.execute(text("SELECT question_ids FROM mock_question_sets WHERE mock_id=CAST(:mid AS UUID) AND student_id=CAST(:uid AS UUID)"),{"mid":mock_id,"uid":str(user["id"])}).first()
+            if set_row:
+                ids=list(set_row[0])
+            else:
+                ids=resolve_question_selection(c,mock["question_ids"] or [],mock["selection_rules"] or [])
+                c.execute(text("INSERT INTO mock_question_sets(mock_id,student_id,question_ids) VALUES(CAST(:mid AS UUID),CAST(:uid AS UUID),CAST(:ids AS JSONB))"),{"mid":mock_id,"uid":str(user["id"]),"ids":json.dumps(ids)})
+        else:
+            if mock["selection_rules"]:
+                ids=resolve_question_selection(c,mock["question_ids"] or [],mock["selection_rules"] or [])
+            else:
+                ids=mock["question_ids"]
+        questions=question_rows(c,ids)
     return [student_question(q) if user["role"]=="student" else q for q in questions]
 
 
