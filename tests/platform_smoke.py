@@ -101,6 +101,8 @@ def run():
 
             resource = expect(client.post("/api/resources", files={"file": ("private.txt", b"protected test file", "text/plain")}, headers=teacher_auth), 201, "protected file upload")
             expect(client.post(f"/api/resources/{resource['id']}/link", json={"target_type": "group", "target_id": group["id"]}, headers=teacher_auth), 201, "resource link")
+            listed_resources = expect(client.get("/api/resources", headers=teacher_auth), 200, "protected resource listing")
+            assert any(item["id"] == resource["id"] for item in listed_resources)
             download = client.get(f"/api/resources/{resource['id']}/download", headers=student_auth)
             if download.status_code != 200:
                 raise AssertionError(f"authorized download: HTTP {download.status_code}: {download.text[:400]}")

@@ -447,8 +447,23 @@ def search_student(student_id: str = Query(min_length=3, max_length=40), group_i
 def list_questions(section: str | None = None, kind: str | None = None, taxonomy_id: str | None = None, user=Depends(get_current_user)):
     require_roles(user, "teacher", "admin", "super_admin")
     clauses = ["q.is_active", "(:admin OR q.owner_id=CAST(:uid AS UUID))"]
-    params = {"admin": is_admin(user), "uid": str(user["id"]), "section": section, "kind": kind, "taxonomy_id": taxonomy_id}
-    clauses.extend(["(:section IS NULL OR q.section=:section)", "(:kind IS NULL OR q.kind=:kind)", "(:taxonomy_id IS NULL OR q.taxonomy_id=CAST(:taxonomy_id AS UUID))"])
+    params = {"admin": is_admin(user), "uid": str(user["id"])}
+    if section is not None:
+        if section not in {"math", "reading_writing"}:
+            raise HTTPException(status_code=422, detail="Savol bo‘limi noto‘g‘ri")
+        clauses.append("q.section=:section")
+        params["section"] = section
+    if kind is not None:
+        if kind not in {"mcq", "spr"}:
+            raise HTTPException(status_code=422, detail="Savol turi noto‘g‘ri")
+        clauses.append("q.kind=:kind")
+        params["kind"] = kind
+    if taxonomy_id is not None:
+        try:
+            params["taxonomy_id"] = str(uuid.UUID(taxonomy_id))
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Taxonomiya ID yaroqsiz")
+        clauses.append("q.taxonomy_id=CAST(:taxonomy_id AS UUID)")
     with engine.connect() as c:
         rows = c.execute(text("""SELECT q.id::text AS id,q.owner_id::text AS owner_id,q.kind,q.section,q.prompt,q.choices,q.answer,
           q.explanation,q.image_url,q.taxonomy_id::text AS taxonomy_id,q.is_active,q.created_at,q.updated_at,
@@ -921,7 +936,7 @@ def list_resources(user=Depends(get_current_user)):
               (CAST(:role AS TEXT)='teacher' AND (a.teacher_id=CAST(:uid AS UUID) OR EXISTS(SELECT 1 FROM group_teachers gt WHERE gt.group_id=a.group_id AND gt.teacher_id=CAST(:uid AS UUID)))))) OR
           (l.target_type='lesson' AND EXISTS(SELECT 1 FROM lessons le WHERE le.id=l.target_id AND
              ((CAST(:role AS TEXT)='student' AND le.status='published' AND EXISTS(SELECT 1 FROM group_members gm WHERE gm.group_id=le.group_id AND gm.student_id=CAST(:uid AS UUID))) OR
-              (CAST(:role AS TEXT)='teacher' AND (le.teacher_id=CAST(:uid AS UUID) OR EXISTS(SELECT 1 FROM group_teachers gt WHERE gt.group_id=le.group_id AND gt.teacher_id=CAST(:uid AS UUID))))))
+              (CAST(:role AS TEXT)='teacher' AND (le.teacher_id=CAST(:uid AS UUID) OR EXISTS(SELECT 1 FROM group_teachers gt WHERE gt.group_id=le.group_id AND gt.teacher_id=CAST(:uid AS UUID))))))))
           OR (l.target_type='post' AND EXISTS(SELECT 1 FROM posts p WHERE p.id=l.target_id AND
              (EXISTS(SELECT 1 FROM group_members gm WHERE gm.group_id=p.group_id AND gm.student_id=CAST(:uid AS UUID)) OR
               EXISTS(SELECT 1 FROM group_teachers gt WHERE gt.group_id=p.group_id AND gt.teacher_id=CAST(:uid AS UUID)))))
